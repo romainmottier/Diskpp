@@ -1,0 +1,509 @@
+
+///////////////////////////////////////////////////////
+/////////////////////////////////////////////////////// Elastic : Reconstruction + Stabilisation 
+///////////////////////////////////////////////////////
+
+Matrix<T, Dynamic, Dynamic> e_mixed_operator(elastic_material_data<T> & material,
+					     const Mesh& msh,
+					     const typename Mesh::cell_type& cell) {
+    
+  T rho = material.rho();
+  T vp = material.vp();
+  T vs = material.vs();
+  T mu = rho * vs * vs;
+  T lambda = rho * vp * vp - 2*mu;
+  
+  auto reconstruction_operator = strain_tensor_reconstruction(msh, cell);
+  Matrix<T, Dynamic, Dynamic> R_operator = reconstruction_operator.second;
+  auto n_rows = R_operator.rows();
+  auto n_cols = R_operator.cols();
+  
+  Matrix<T, Dynamic, Dynamic> S_operator = Matrix<T, Dynamic, Dynamic>::Zero(n_rows, n_cols);
+
+  // Equal order 
+  if(m_hho_stabilization_Q) {
+    auto rec_for_stab = make_vector_hho_symmetric_laplacian(msh, cell, m_hho_di);
+    auto stabilization_operator = make_vector_hho_stabilization(msh,cell,rec_for_stab.first,
+								m_hho_di,m_scaled_stabilization_Q);
+    auto n_s_rows = stabilization_operator.rows();
+    auto n_s_cols = stabilization_operator.cols();
+    S_operator.block(n_rows-n_s_rows, n_cols-n_s_cols, n_s_rows, n_s_cols) = stabilization_operator;
+  }
+  // Mixed order 
+  else {
+    auto stabilization_operator = make_vector_hdg_stabilization(msh, cell, m_hho_di,
+								m_scaled_stabilization_Q);
+    auto n_s_rows = stabilization_operator.rows();
+    auto n_s_cols = stabilization_operator.cols();
+    S_operator.block(n_rows-n_s_rows, n_cols-n_s_cols, n_s_rows, n_s_cols) = stabilization_operator;
+  }
+  
+  return R_operator + (rho*vs)*S_operator;
+  
+}
+
+///////////////////////////////////////////////////////
+/////////////////////////////////////////////////////// Elastic : Mass matrix for sigma 
+///////////////////////////////////////////////////////
+
+Matrix<T, Dynamic, Dynamic> symmetric_tensor_mass_matrix(const Mesh& msh,
+							 const typename Mesh::cell_type& cell) {
+    
+  size_t dim  = Mesh::dimension;
+  auto gradeg = m_hho_di.grad_degree();
+  auto ten_b  = make_sym_matrix_monomial_basis(msh, cell, gradeg);
+  auto ten_bs = disk::sym_matrix_basis_size(gradeg, dim, dim);
+  Matrix<T, Dynamic, Dynamic> mass_matrix = Matrix<T, Dynamic, Dynamic>::Zero(ten_bs, ten_bs);
+  auto qps = integrate(msh, cell, 2 * gradeg);
+  
+  // number of tensor components
+  size_t dec = 0;
+  if (dim == 3)
+    dec = 6;
+  else if (dim == 2)
+    dec = 3;
+  else
+    std::logic_error("Expected 3 >= dim > 1");
+  
+  for (auto& qp : qps) {
+    auto phi = ten_b.eval_functions(qp.point());
+    for (size_t j = 0; j < ten_bs; j++) {
+      auto qp_phi_j = disk::priv::inner_product(qp.weight(), phi[j]);
+      for (size_t i = j; i < ten_bs; i += dec){
+	mass_matrix(i, j) += disk::priv::inner_product(phi[i], qp_phi_j);
+      }
+    }
+  }
+  
+  for (size_t j = 0; j < ten_bs; j++){
+    for (size_t i = 0; i < j; i++){
+      mass_matrix(i, j) = mass_matrix(j, i);
+    }
+  }  
+  return mass_matrix;
+}
+
+///////////////////////////////////////////////////////
+/////////////////////////////////////////////////////// Elastic : Trace Mass matrix for sigma 
+///////////////////////////////////////////////////////
+
+Matrix<T, Dynamic, Dynamic> symmetric_tensor_trace_mass_matrix(const Mesh& msh,
+							       const typename Mesh::cell_type& cell) {
+  
+  size_t dim  = Mesh::dimension;
+  auto gradeg = m_hho_di.grad_degree();
+  auto ten_b  = make_sym_matrix_monomial_basis(msh, cell, gradeg);
+  auto ten_bs = disk::sym_matrix_basis_size(gradeg, dim, dim);
+  Matrix<T, Dynamic, Dynamic> mass_matrix = Matrix<T, Dynamic, Dynamic>::Zero(ten_bs, ten_bs);
+  auto qps = integrate(msh, cell, 2 * gradeg);
+  
+  // number of tensor components
+  size_t dec = 0;
+  if (dim == 3)
+    dec = 6;
+  else if (dim == 2)
+    dec = 3;
+  else
+    std::logic_error("Expected 3 >= dim > 1");
+  
+  for (auto& qp : qps) {
+    auto phi = ten_b.eval_functions(qp.point());
+    for (size_t j = 0; j < ten_bs; j++) {
+      auto identity = phi[j];
+      identity.setZero();
+      for(size_t d = 0; d < dim; d++) {
+	identity(d,d) = 1.0;
+      }
+      auto trace = phi[j].trace();
+      auto trace_phi_j = disk::priv::inner_product(phi[j].trace(), identity);
+      auto qp_phi_j = disk::priv::inner_product(qp.weight(), trace_phi_j);
+      for (size_t i = 0; i < ten_bs; i ++){
+	mass_matrix(i, j) += disk::priv::inner_product(phi[i], qp_phi_j);
+      }
+    }
+  }
+  return mass_matrix;
+}
+
+///////////////////////////////////////////////////////
+/////////////////////////////////////////////////////// Elastic : Mass matrix for sigma 
+///////////////////////////////////////////////////////
+
+Matrix<typename Mesh::coordinate_type,Dynamic,1> e_mixed_rhs(
+		  const Mesh& msh,
+		  const typename Mesh::cell_type& cell,
+		  std::function<static_vector<double, 2>(const typename Mesh::point_type& )> & rhs_fun,
+		  size_t di = 0) {
+
+  auto recdeg  = m_hho_di.grad_degree();
+  auto celdeg  = m_hho_di.cell_degree();
+  auto facdeg  = m_hho_di.face_degree();
+  
+  auto ten_bs  = disk::sym_matrix_basis_size(recdeg, Mesh::dimension, Mesh::dimension);
+  auto vec_bs  = disk::vector_basis_size(celdeg, Mesh::dimension, Mesh::dimension);
+  size_t n_cbs = ten_bs + vec_bs;
+  auto cell_basis = make_vector_monomial_basis(msh, cell, celdeg);
+  using T = typename Mesh::coordinate_type;
+  
+  Matrix<T, Dynamic, 1> ret_loc = Matrix<T, Dynamic, 1>::Zero(cell_basis.size());
+  Matrix<T, Dynamic, 1> ret = Matrix<T, Dynamic, 1>::Zero(n_cbs);
+  
+  const auto qps = integrate(msh, cell, 2 * (celdeg + di));
+  
+  for (auto& qp : qps) {
+    const auto phi  = cell_basis.eval_functions(qp.point());
+    const auto qp_f = disk::priv::inner_product(qp.weight(), rhs_fun(qp.point()));
+    ret_loc += disk::priv::outer_product(phi, qp_f);
+  }
+  ret.block(ten_bs,0,vec_bs,1) = ret_loc;
+  return ret;
+}
+
+///////////////////////////////////////////////////////
+/////////////////////////////////////////////////////// Elastic mass matrix 
+///////////////////////////////////////////////////////
+
+Matrix<T, Dynamic, Dynamic> e_mass_operator(elastic_material_data<T> & material,
+					    const Mesh& msh,
+					    const typename Mesh::cell_type& cell,
+					    bool add_vector_mass_Q = true) {
+  
+  size_t n_ten_cbs = disk::sym_matrix_basis_size(m_hho_di.grad_degree(),
+						 Mesh::dimension,
+						 Mesh::dimension);
+  
+  size_t n_vec_cbs = disk::vector_basis_size(m_hho_di.cell_degree(),
+					     Mesh::dimension,
+					     Mesh::dimension);
+  
+  size_t n_cbs = n_ten_cbs + n_vec_cbs;
+  
+  T rho = material.rho();
+  T vp = material.vp();
+  T vs = material.vs();
+  T mu = rho * vs * vs;
+  T lambda = rho * vp * vp - 2*mu;
+  
+  Matrix<T, Dynamic, Dynamic> mass_matrix = Matrix<T, Dynamic, Dynamic>::Zero(n_cbs, n_cbs);
+  
+  // Symmetric stress tensor mass block    
+  // Stress tensor
+  Matrix<T, Dynamic, Dynamic> mass_matrix_sigma  = symmetric_tensor_mass_matrix(msh, cell);
+  // Tensor trace
+  Matrix<T, Dynamic, Dynamic> mass_matrix_trace_sigma =symmetric_tensor_trace_mass_matrix(msh,cell);
+  
+  // Constitutive relationship inverse
+  mass_matrix_trace_sigma *= (lambda/(2.0*mu+2.0*lambda));
+  mass_matrix_sigma       -= mass_matrix_trace_sigma;
+  mass_matrix_sigma       *= (1.0/(2.0*mu));
+  mass_matrix.block(0, 0, n_ten_cbs, n_ten_cbs) = mass_matrix_sigma;
+  
+  if (add_vector_mass_Q) {
+    // vector velocity mass mass block
+    auto vec_basis = disk::make_vector_monomial_basis(msh, cell, m_hho_di.cell_degree());
+    Matrix<T, Dynamic, Dynamic> mass_matrix_v = disk::make_mass_matrix(msh, cell, vec_basis);
+    mass_matrix_v *= rho;
+    mass_matrix.block(n_ten_cbs, n_ten_cbs, n_vec_cbs, n_vec_cbs) = mass_matrix_v;
+  }
+  
+  return mass_matrix;
+  
+}
+
+///////////////////////////////////////////////////////
+/////////////////////////////////////////////////////// Acoustic mass matrix 
+///////////////////////////////////////////////////////
+
+Matrix<T, Dynamic, Dynamic> a_mass_operator(acoustic_material_data<T> & material,
+					    const Mesh& msh,
+					    const typename Mesh::cell_type& cell,
+					    bool add_scalar_mass_Q = true) {
+  
+  size_t n_scal_cbs = disk::scalar_basis_size(m_hho_di.cell_degree(), Mesh::dimension);
+  size_t n_vec_cbs  = disk::scalar_basis_size(m_hho_di.reconstruction_degree(), Mesh::dimension)-1;
+  size_t n_cbs      = n_scal_cbs + n_vec_cbs;
+  
+  Matrix<T, Dynamic, Dynamic> mass_matrix = Matrix<T, Dynamic, Dynamic>::Zero(n_cbs, n_cbs);
+  
+  auto recdeg    = m_hho_di.reconstruction_degree();
+  auto rec_basis = make_scalar_monomial_basis(msh, cell, recdeg);
+  auto rbs       = disk::scalar_basis_size(recdeg, Mesh::dimension);
+  
+  Matrix<T, Dynamic, Dynamic> mass_matrix_q_full  = make_stiffness_matrix(msh, cell, rec_basis);
+  Matrix<T, Dynamic, Dynamic> mass_matrix_q       = Matrix<T, Dynamic, Dynamic>::Zero(rbs-1, rbs-1);
+  mass_matrix_q = mass_matrix_q_full.block(1, 1, rbs-1, rbs-1);
+  mass_matrix_q *= material.rho();
+  mass_matrix.block(0, 0, n_vec_cbs, n_vec_cbs) = mass_matrix_q;
+  
+  if (add_scalar_mass_Q) {
+    auto scal_basis = disk::make_scalar_monomial_basis(msh, cell, m_hho_di.cell_degree());
+    Matrix<T, Dynamic, Dynamic> mass_matrix_v = disk::make_mass_matrix(msh, cell, scal_basis);
+    mass_matrix_v *= (1.0/(material.rho()*material.vp()*material.vp()));
+    mass_matrix.block(n_vec_cbs, n_vec_cbs, n_scal_cbs, n_scal_cbs) = mass_matrix_v;
+  }  
+  return mass_matrix;
+}
+
+///////////////////////////////////////////////////////
+/////////////////////////////////////////////////////// Strain tensor reconstruction  
+///////////////////////////////////////////////////////
+
+std::pair<Matrix<typename Mesh::coordinate_type, Dynamic, Dynamic>,
+	  Matrix<typename Mesh::coordinate_type, Dynamic, Dynamic> >
+          strain_tensor_reconstruction(const Mesh& msh, const typename Mesh::cell_type& cell) {
+  
+  using T = typename Mesh::coordinate_type;
+  typedef Matrix<T, Dynamic, Dynamic> matrix_type;
+  
+  const size_t N = Mesh::dimension;
+  
+  auto graddeg = m_hho_di.grad_degree();
+  auto celdeg  = m_hho_di.cell_degree();
+  auto facdeg  = m_hho_di.face_degree();
+  
+  auto ten_b = make_sym_matrix_monomial_basis(msh, cell, graddeg);
+  auto vec_b = make_vector_monomial_basis(msh, cell, celdeg);
+  
+  auto ten_bs = disk::sym_matrix_basis_size(graddeg, Mesh::dimension, Mesh::dimension);
+  auto vec_bs = disk::vector_basis_size(celdeg, Mesh::dimension, Mesh::dimension);
+  auto fbs = disk::vector_basis_size(facdeg, Mesh::dimension - 1, Mesh::dimension);
+  
+  auto num_faces = howmany_faces(msh, cell);
+  
+  matrix_type gr_lhs = matrix_type::Zero(ten_bs, ten_bs);
+  matrix_type gr_rhs = matrix_type::Zero(ten_bs, vec_bs + num_faces * fbs);
+  
+  const auto qps = integrate(msh, cell, 2 * graddeg);
+  
+  size_t dec = 0;
+  if (N == 3)
+    dec = 6;
+  else if (N == 2)
+    dec = 3;
+  else
+    std::logic_error("Expected 3 >= dim > 1");
+  
+  for (auto& qp : qps) {
+    const auto gphi = ten_b.eval_functions(qp.point());
+    
+    for (size_t j = 0; j < ten_bs; j++) {
+      auto qp_gphi_j = disk::priv::inner_product(qp.weight(), gphi[j]);
+      for (size_t i = j; i < ten_bs; i += dec){
+	gr_lhs(i, j) += disk::priv::inner_product(gphi[i], qp_gphi_j);
+      }
+    }
+  }
+  
+  for (size_t j = 0; j < ten_bs; j++)
+    for (size_t i = 0; i < j; i++)
+      gr_lhs(i, j) = gr_lhs(j, i);
+  
+  if (celdeg > 0) {
+    const auto qpc = integrate(msh, cell, graddeg + celdeg - 1);
+    for (auto& qp : qpc) {
+      const auto gphi    = ten_b.eval_functions(qp.point());
+      const auto dphi    = vec_b.eval_sgradients(qp.point());
+      const auto qp_dphi = disk::priv::inner_product(qp.weight(), dphi);
+      gr_rhs.block(0, 0, ten_bs, vec_bs) += disk::priv::outer_product(gphi, qp_dphi);
+    }
+  }
+  
+  const auto fcs = faces(msh, cell);
+  for (size_t i = 0; i < fcs.size(); i++) {
+    const auto fc = fcs[i];
+    const auto n  = normal(msh, cell, fc);
+    const auto fb = make_vector_monomial_basis(msh, fc, facdeg);
+    const auto qps_f = integrate(msh, fc, graddeg + std::max(celdeg, facdeg));
+    for (auto& qp : qps_f) {
+      const auto gphi = ten_b.eval_functions(qp.point());
+      const auto cphi = vec_b.eval_functions(qp.point());
+      const auto fphi = fb.eval_functions(qp.point());
+      const auto qp_gphi_n = disk::priv::inner_product(gphi,disk::priv::inner_product(qp.weight(), n));
+      gr_rhs.block(0, vec_bs + i * fbs, ten_bs, fbs) += disk::priv::outer_product(qp_gphi_n, fphi);
+      gr_rhs.block(0, 0, ten_bs, vec_bs) -= disk::priv::outer_product(qp_gphi_n, cphi);
+    }
+  }
+  
+  auto n_rows = gr_rhs.cols() + ten_bs;
+  auto n_cols = gr_rhs.cols() + ten_bs;
+  
+  // Shrinking data
+  matrix_type data_mixed = matrix_type::Zero(n_rows,n_cols);
+  data_mixed.block(0, (ten_bs), ten_bs, n_cols-(ten_bs)) = -gr_rhs;
+  data_mixed.block((ten_bs), 0, n_rows-(ten_bs), ten_bs) = gr_rhs.transpose();
+  
+  matrix_type oper = gr_lhs.llt().solve(gr_rhs);
+  return std::make_pair(oper, data_mixed);
+  
+}
+
+///////////////////////////////////////////////////////
+/////////////////////////////////////////////////////// Acoustic : Reconstruction + Stabilisation 
+///////////////////////////////////////////////////////
+
+Matrix<T, Dynamic, Dynamic> a_mixed_operator(acoustic_material_data<T> & material,
+					     const Mesh& msh,
+					     const typename Mesh::cell_type& cell) {
+  
+  auto reconstruction_operator = mixed_scalar_reconstruction(msh, cell);
+  Matrix<T, Dynamic, Dynamic> R_operator = reconstruction_operator.second;
+  auto n_rows = R_operator.rows();
+  auto n_cols = R_operator.cols();
+  
+  Matrix<T, Dynamic, Dynamic> S_operator = Matrix<T, Dynamic, Dynamic>::Zero(n_rows, n_cols);
+  
+  if(m_hho_stabilization_Q) {
+    auto stabilization_operator = make_scalar_hho_stabilization(msh,cell,reconstruction_operator.first,
+								m_hho_di,m_scaled_stabilization_Q);
+    auto n_s_rows = stabilization_operator.rows();
+    auto n_s_cols = stabilization_operator.cols();
+    S_operator.block(n_rows-n_s_rows, n_cols-n_s_cols, n_s_rows, n_s_cols) = stabilization_operator;
+  }
+    
+  else {
+    auto stabilization_operator = make_scalar_hdg_stabilization(msh,cell,m_hho_di,
+								m_scaled_stabilization_Q);
+    auto n_s_rows = stabilization_operator.rows();
+    auto n_s_cols = stabilization_operator.cols();
+    S_operator.block(n_rows-n_s_rows, n_cols-n_s_cols, n_s_rows, n_s_cols) = stabilization_operator;
+  }
+
+  T rho = material.rho();
+  T vp = material.vp();
+
+  return R_operator + ((0.1)/(vp*rho))*S_operator;
+
+}
+
+///////////////////////////////////////////////////////
+/////////////////////////////////////////////////////// Acoustic : Reconstruction  
+///////////////////////////////////////////////////////
+
+std::pair<Matrix<typename Mesh::coordinate_type, Dynamic, Dynamic>,
+	  Matrix<typename Mesh::coordinate_type, Dynamic, Dynamic>>
+     mixed_scalar_reconstruction(const Mesh& msh, const typename Mesh::cell_type& cell) {
+
+  using T = typename Mesh::coordinate_type;
+  typedef Matrix<T, Dynamic, Dynamic> matrix_type;
+  typedef Matrix<T, Dynamic, 1>       vector_type;
+  
+  const size_t DIM = Mesh::dimension;
+  
+  const auto recdeg = m_hho_di.reconstruction_degree();
+  const auto celdeg = m_hho_di.cell_degree();
+  const auto facdeg = m_hho_di.face_degree();
+  
+  auto cb = make_scalar_monomial_basis(msh, cell, recdeg);
+  
+  const auto rbs = disk::scalar_basis_size(recdeg, Mesh::dimension);
+  const auto cbs = disk::scalar_basis_size(celdeg, Mesh::dimension);
+  const auto fbs = disk::scalar_basis_size(facdeg, Mesh::dimension - 1);
+  
+  const auto num_faces = howmany_faces(msh, cell);
+  
+  const matrix_type stiff  = make_stiffness_matrix(msh, cell, cb);
+  matrix_type gr_lhs = matrix_type::Zero(rbs-1, rbs-1);
+  matrix_type gr_rhs = matrix_type::Zero(rbs-1, cbs + num_faces*fbs);
+  
+  gr_lhs = stiff.block(1, 1, rbs-1, rbs-1);
+  gr_rhs.block(0, 0, rbs-1, cbs) = stiff.block(1, 0, rbs-1, cbs);
+  
+  const auto fcs = faces(msh, cell);
+
+  for (size_t i = 0; i < fcs.size(); i++) {
+    
+    const auto fc = fcs[i];
+    const auto n  = normal(msh, cell, fc);
+    auto fb = make_scalar_monomial_basis(msh, fc, facdeg);
+    
+    auto qps_f = integrate(msh, fc, recdeg - 1 + std::max(facdeg,celdeg));
+
+    for (auto& qp : qps_f) {
+      vector_type c_phi_tmp = cb.eval_functions(qp.point());
+      vector_type c_phi = c_phi_tmp.head(cbs);
+      Matrix<T, Dynamic, DIM> c_dphi_tmp = cb.eval_gradients(qp.point());
+      Matrix<T, Dynamic, DIM> c_dphi = c_dphi_tmp.block(1, 0, rbs-1, DIM);
+      vector_type f_phi = fb.eval_functions(qp.point());
+      gr_rhs.block(0, cbs+i*fbs, rbs-1, fbs) += qp.weight() * (c_dphi * n) * f_phi.transpose();
+      gr_rhs.block(0, 0, rbs-1, cbs) -= qp.weight() * (c_dphi * n) * c_phi.transpose();
+    }
+
+  }
+  
+  auto vec_cell_size = gr_lhs.cols();
+  auto nrows = gr_rhs.cols()+vec_cell_size;
+  auto ncols = gr_rhs.cols()+vec_cell_size;
+  
+  // Shrinking data
+  matrix_type data_mixed = matrix_type::Zero(nrows,ncols);
+  data_mixed.block(0, vec_cell_size, vec_cell_size, ncols-vec_cell_size) = -gr_rhs;
+  data_mixed.block(vec_cell_size, 0, nrows-vec_cell_size, vec_cell_size) = gr_rhs.transpose();
+  
+  matrix_type oper = gr_lhs.llt().solve(gr_rhs);
+  return std::make_pair(oper, data_mixed);
+}
+
+///////////////////////////////////////////////////////
+/////////////////////////////////////////////////////// Acoustic : RHS 
+///////////////////////////////////////////////////////
+
+Matrix<typename Mesh::coordinate_type, Dynamic, 1>
+  a_mixed_rhs(const Mesh& msh,const typename Mesh::cell_type& cell,
+	      std::function<double(const typename Mesh::point_type& )> & rhs_fun, size_t di = 0) {
+  
+  const auto recdeg = m_hho_di.reconstruction_degree();
+  const auto celdeg = m_hho_di.cell_degree();
+  const auto rbs = disk::scalar_basis_size(recdeg, Mesh::dimension) - 1;
+  const auto cbs = disk::scalar_basis_size(celdeg, Mesh::dimension) + rbs;
+  auto cell_basis = make_scalar_monomial_basis(msh, cell, celdeg);
+  using T = typename Mesh::coordinate_type;
+  
+  Matrix<T, Dynamic, 1> ret_loc = Matrix<T, Dynamic, 1>::Zero(cell_basis.size());
+  Matrix<T, Dynamic, 1> ret = Matrix<T, Dynamic, 1>::Zero(cbs);
+  
+  const auto qps = integrate(msh, cell, 2 * (celdeg + di));
+  
+  for (auto& qp : qps) {
+    const auto phi  = cell_basis.eval_functions(qp.point());
+    const auto qp_f = disk::priv::inner_product(qp.weight(), rhs_fun(qp.point()));
+    ret_loc += disk::priv::outer_product(phi, qp_f);
+  }
+  ret.block(rbs,0,cell_basis.size(),1) = ret_loc;
+  return ret;
+}
+
+///////////////////////////////////////////////////////
+/////////////////////////////////////////////////////// Interface operator  
+///////////////////////////////////////////////////////
+
+Matrix<T, Dynamic, Dynamic> e_interface_operator(const Mesh& msh, const typename Mesh::face_type& face,
+						 const typename Mesh::cell_type& e_cell,
+						 const typename Mesh::cell_type& a_cell) {
+  
+  Matrix<T, Dynamic, Dynamic> interface_operator;
+  auto facdeg = m_hho_di.face_degree();
+  auto vfbs = disk::vector_basis_size(m_hho_di.face_degree(), Mesh::dimension - 1, Mesh::dimension);
+  auto sfbs = disk::scalar_basis_size(facdeg, Mesh::dimension - 1);
+  interface_operator = Matrix<T, Dynamic, Dynamic>::Zero(vfbs, sfbs);
+  
+  auto vfb = make_vector_monomial_basis(msh, face, facdeg);
+  auto sfb = make_scalar_monomial_basis(msh, face, facdeg);
+  const auto qps = integrate(msh, face, facdeg);
+  const auto n = disk::normal(msh, e_cell, face);
+  
+  for (auto& qp : qps) {
+    const auto v_f_phi = vfb.eval_functions(qp.point());
+    const auto s_f_phi = sfb.eval_functions(qp.point());    
+    assert(v_f_phi.rows() == vfbs);
+    assert(s_f_phi.rows() == sfbs);
+    const auto n_w = disk::priv::inner_product(qp.weight(), n);
+    const auto n_dot_v_f_phi = disk::priv::inner_product(v_f_phi,n_w);
+    const auto result = -1.0*disk::priv::outer_product(n_dot_v_f_phi, s_f_phi);
+    interface_operator += result;
+    //std::cout << "blabla";
+    //std::cout <<  result  << std::endl; 
+  }
+  
+  return interface_operator;
+  
+}                   

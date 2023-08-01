@@ -1,0 +1,153 @@
+
+
+
+void project_over_cells(
+		  const Mesh& msh,
+		  Matrix<T, Dynamic, 1> & x_glob,
+		  std::function<static_vector<T, 2>(const typename Mesh::point_type& )> v_fun,
+		  std::function<static_matrix<T,2,2>(const typename Mesh::point_type& )> flux_fun,
+		  std::function<T(const typename Mesh::point_type& )> v_s_fun,
+		  std::function<static_vector<T, 2>(const typename Mesh::point_type& )> flux_s_fun) {
+        
+  auto storage = msh.backend_storage();
+  size_t n_dof = MASS.rows();
+  x_glob = Matrix<T, Dynamic, 1>::Zero(n_dof);
+  
+  // elastic block
+  size_t n_ten_cbs=disk::sym_matrix_basis_size(m_hho_di.grad_degree(),Mesh::dimension,Mesh::dimension);
+  size_t n_vec_cbs = disk::vector_basis_size(m_hho_di.cell_degree(),Mesh::dimension, Mesh::dimension);
+  size_t n_e_cbs = n_ten_cbs + n_vec_cbs;
+    
+  for (auto e_chunk : m_e_material) {
+    size_t e_cell_ind = m_e_cell_index[e_chunk.first];
+    auto& cell = storage->surfaces[e_chunk.first];
+    
+    Matrix<T, Dynamic, 1> x_proj_ten_dof = project_ten_function(msh, cell, flux_fun);
+    Matrix<T, Dynamic, 1> x_proj_vec_dof = project_function(msh, cell, m_hho_di.cell_degree(), v_fun);
+    
+    Matrix<T, Dynamic, 1> x_proj_dof = Matrix<T, Dynamic, 1>::Zero(n_e_cbs);
+    x_proj_dof.block(0, 0, n_ten_cbs, 1)          = x_proj_ten_dof;
+    x_proj_dof.block(n_ten_cbs, 0, n_vec_cbs, 1)  = x_proj_vec_dof;
+    
+    scatter_e_cell_dof_data(e_cell_ind, msh, cell, x_glob, x_proj_dof);
+  }
+  
+  // acoustic block
+  size_t n_scal_cbs = disk::scalar_basis_size(m_hho_di.cell_degree(), Mesh::dimension);
+  size_t n_v_s_cbs = disk::scalar_basis_size(m_hho_di.reconstruction_degree(), Mesh::dimension)-1;
+  size_t n_a_cbs = n_v_s_cbs + n_scal_cbs;
+  
+  for (auto a_chunk : m_a_material) {  
+    size_t a_cell_ind = m_a_cell_index[a_chunk.first];
+    auto& cell = storage->surfaces[a_chunk.first];
+      
+    Matrix<T, Dynamic, 1> x_proj_vec_dof = project_vec_function(msh, cell, flux_s_fun);
+    Matrix<T, Dynamic, 1> x_proj_sca_dof = project_function(msh,cell,m_hho_di.cell_degree(),v_s_fun);
+    
+    Matrix<T, Dynamic, 1> x_proj_dof = Matrix<T, Dynamic, 1>::Zero(n_a_cbs);
+    x_proj_dof.block(0, 0, n_v_s_cbs, 1) = x_proj_vec_dof;
+    x_proj_dof.block(n_v_s_cbs, 0, n_scal_cbs, 1) = x_proj_sca_dof;
+    
+    scatter_a_cell_dof_data(a_cell_ind, msh, cell, x_glob, x_proj_dof);   
+  }
+  
+}
+
+
+Matrix<T, Dynamic, 1> project_vec_function(
+		   const Mesh& msh,
+		   const typename Mesh::cell_type& cell,
+		   std::function<static_vector<double,2>(const typename Mesh::point_type&)> vec_fun) {
+  
+  auto recdeg = m_hho_di.reconstruction_degree();
+  auto rec_basis = make_scalar_monomial_basis(msh, cell, recdeg);
+  auto rbs = disk::scalar_basis_size(recdeg, Mesh::dimension);
+  Matrix<T, Dynamic, Dynamic> mass_matrix_q_full  = make_stiffness_matrix(msh, cell, rec_basis);
+  Matrix<T, Dynamic, Dynamic> mass_matrix_q = Matrix<T, Dynamic, Dynamic>::Zero(rbs-1, rbs-1);
+  mass_matrix_q = mass_matrix_q_full.block(1, 1, rbs-1, rbs-1);
+  
+  Matrix<T, Dynamic, 1> rhs = Matrix<T, Dynamic, 1>::Zero(rbs-1);
+  Matrix<T, 1, 2> f_vec = Matrix<T, Dynamic, Dynamic>::Zero(1, 2);
+  const auto qps = integrate(msh, cell, 2*recdeg);
+  for (auto& qp : qps) {
+    auto dphi = rec_basis.eval_gradients(qp.point());
+    f_vec(0,0) = vec_fun(qp.point())[0];
+    f_vec(0,1) = vec_fun(qp.point())[1];
+    for (size_t i = 0; i < rbs-1; i++){
+      Matrix<T, 2, 1> phi_i = dphi.block(i+1, 0, 1, 2).transpose();
+      rhs(i,0) = rhs(i,0) + (qp.weight() * f_vec*phi_i)(0,0);
+    }
+  }
+  Matrix<T, Dynamic, 1> x_dof = mass_matrix_q.llt().solve(rhs);
+  return x_dof;
+}
+
+Matrix<T, Dynamic, 1> project_ten_function(
+		   const Mesh& msh,
+		   const typename Mesh::cell_type& cell,
+		   std::function<static_matrix<T, 2,2>(const typename Mesh::point_type& )> ten_fun) {
+  
+  Matrix<T, Dynamic, Dynamic> mass_matrix = symmetric_tensor_mass_matrix(msh, cell);
+  size_t dim = Mesh::dimension;
+  auto gradeg = m_hho_di.grad_degree();
+  auto ten_bs = disk::sym_matrix_basis_size(gradeg, dim, dim);
+  auto ten_b = make_sym_matrix_monomial_basis(msh, cell, gradeg);
+  Matrix<T, Dynamic, 1> rhs = Matrix<T, Dynamic, 1>::Zero(ten_bs);
+  
+  const auto qps = integrate(msh, cell, 2 * gradeg);
+
+  for (auto& qp : qps) {
+    auto phi = ten_b.eval_functions(qp.point());
+    static_matrix<T, 2,2> sigma = ten_fun(qp.point());
+    for (size_t i = 0; i < ten_bs; i++){
+      auto qp_phi_i = disk::priv::inner_product(qp.weight(), phi[i]);
+      rhs(i,0) += disk::priv::inner_product(qp_phi_i,sigma);
+    }
+  }
+  
+  Matrix<T, Dynamic, 1> x_dof = mass_matrix.llt().solve(rhs);
+  return x_dof;
+
+}
+
+
+void project_over_faces(const Mesh& msh, Matrix<T, Dynamic, 1> & x_glob,
+			std::function<static_vector<T, 2>(const typename Mesh::point_type& )> vec_fun,
+			std::function<T(const typename Mesh::point_type& )> scal_fun) {
+  
+  auto storage = msh.backend_storage();
+  
+  // elastic block
+  for (auto e_chunk : m_e_material) {
+    auto& cell = storage->surfaces[e_chunk.first];
+    auto fcs = faces(msh, cell);
+    for (size_t i = 0; i < fcs.size(); i++) {
+      auto face = fcs[i];
+      auto fc_id = msh.lookup(face);
+      bool is_dirichlet_Q = m_e_bnd.is_dirichlet_face(fc_id);
+      if (is_dirichlet_Q) {
+	continue;
+      }
+      Matrix<T, Dynamic, 1> x_proj_dof = project_function(msh, face, m_hho_di.face_degree(), vec_fun);
+      scatter_e_face_dof_data(msh, face, x_glob, x_proj_dof);
+    }
+  }
+  
+  // acoustic block
+  for (auto a_chunk : m_a_material) {
+    auto& cell = storage->surfaces[a_chunk.first];
+    auto fcs = faces(msh, cell);
+    for (size_t i = 0; i < fcs.size(); i++) {
+      auto face = fcs[i];
+      auto fc_id = msh.lookup(face);
+      bool is_dirichlet_Q = m_a_bnd.is_dirichlet_face(fc_id);
+      if (is_dirichlet_Q) {
+	continue;
+      }
+      Matrix<T, Dynamic, 1> x_proj_dof = project_function(msh, face, m_hho_di.face_degree(), scal_fun);
+      scatter_a_face_dof_data(msh, face, x_glob, x_proj_dof);
+    }
+  }
+}
+
+  
