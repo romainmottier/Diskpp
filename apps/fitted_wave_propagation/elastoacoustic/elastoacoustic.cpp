@@ -86,7 +86,7 @@ int main(int argc, char **argv){
 // Stability study & Spectral radius computation:
    // EAcoustic_stability(argc, argv);
    // EElastic_stability(argc, argv);
-   EHHOFirstOrder_stability(argc, argv); 
+   // EHHOFirstOrder_stability(argc, argv); 
 
 // Convergence test:
    // IAcoustic_conv_test(argc, argv);
